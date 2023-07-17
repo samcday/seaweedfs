@@ -18,8 +18,6 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/s3api/s3err"
 )
 
-const cutoffTimeNewEmptyDir = 3
-
 type ListBucketResultV2 struct {
 	XMLName               xml.Name      `xml:"http://s3.amazonaws.com/doc/2006-03-01/ ListBucketResult"`
 	Name                  string        `xml:"Name"`
@@ -142,7 +140,7 @@ func (s3a *S3ApiServer) listFilerEntries(bucket string, originalPrefix string, m
 	var nextMarker string
 	cursor := &ListingCursor{
 		maxKeys:               maxKeys,
-		prefixEndsOnDelimiter: strings.HasSuffix(originalPrefix, "/"),
+		prefixEndsOnDelimiter: strings.HasSuffix(originalPrefix, "/") && len(originalMarker) == 0,
 	}
 
 	// check filer
@@ -152,14 +150,7 @@ func (s3a *S3ApiServer) listFilerEntries(bucket string, originalPrefix string, m
 			nextMarker, doErr = s3a.doListFilerEntries(client, reqDir, prefix, cursor, marker, delimiter, false, func(dir string, entry *filer_pb.Entry) {
 				empty = false
 				if entry.IsDirectory {
-					// https://docs.aws.amazon.com/AmazonS3/latest/API/API_ListObjectsV2.html
-					if delimiter == "/" { // A response can contain CommonPrefixes only if you specify a delimiter.
-						commonPrefixes = append(commonPrefixes, PrefixEntry{
-							Prefix: fmt.Sprintf("%s/%s/", dir, entry.Name)[len(bucketPrefix):],
-						})
-						//All of the keys (up to 1,000) rolled up into a common prefix count as a single return when calculating the number of returns.
-						cursor.maxKeys--
-					} else if entry.IsDirectoryKeyObject() {
+					if entry.IsDirectoryKeyObject() {
 						contents = append(contents, ListEntry{
 							Key:          fmt.Sprintf("%s/%s/", dir, entry.Name)[len(bucketPrefix):],
 							LastModified: time.Unix(entry.Attributes.Mtime, 0).UTC(),
@@ -170,6 +161,13 @@ func (s3a *S3ApiServer) listFilerEntries(bucket string, originalPrefix string, m
 							},
 							StorageClass: "STANDARD",
 						})
+						cursor.maxKeys--
+						// https://docs.aws.amazon.com/AmazonS3/latest/API/API_ListObjectsV2.html
+					} else if delimiter == "/" { // A response can contain CommonPrefixes only if you specify a delimiter.
+						commonPrefixes = append(commonPrefixes, PrefixEntry{
+							Prefix: fmt.Sprintf("%s/%s/", dir, entry.Name)[len(bucketPrefix):],
+						})
+						//All of the keys (up to 1,000) rolled up into a common prefix count as a single return when calculating the number of returns.
 						cursor.maxKeys--
 					}
 				} else {
@@ -238,7 +236,11 @@ type ListingCursor struct {
 func normalizePrefixMarker(prefix, marker string) (alignedDir, alignedPrefix, alignedMarker string) {
 	// alignedDir should not end with "/"
 	// alignedDir, alignedPrefix, alignedMarker should only have "/" in middle
-	prefix = strings.Trim(prefix, "/")
+	if len(marker) == 0 {
+		prefix = strings.Trim(prefix, "/")
+	} else {
+		prefix = strings.TrimLeft(prefix, "/")
+	}
 	marker = strings.TrimLeft(marker, "/")
 	if prefix == "" {
 		return "", "", marker
@@ -368,6 +370,9 @@ func (s3a *S3ApiServer) doListFilerEntries(client filer_pb.SeaweedFilerClient, d
 			if delimiter != "/" || cursor.prefixEndsOnDelimiter {
 				if cursor.prefixEndsOnDelimiter {
 					cursor.prefixEndsOnDelimiter = false
+					if entry.IsDirectoryKeyObject() {
+						eachEntryFn(dir, entry)
+					}
 				} else {
 					eachEntryFn(dir, entry)
 				}
@@ -384,7 +389,7 @@ func (s3a *S3ApiServer) doListFilerEntries(client filer_pb.SeaweedFilerClient, d
 				// println("doListFilerEntries2 nextMarker", nextMarker)
 			} else {
 				var isEmpty bool
-				if !s3a.option.AllowEmptyFolder && !entry.IsDirectoryKeyObject() {
+				if !s3a.option.AllowEmptyFolder && entry.IsOlderDir() {
 					if isEmpty, err = s3a.ensureDirectoryAllEmpty(client, dir, entry.Name); err != nil {
 						glog.Errorf("check empty folder %s: %v", dir, err)
 					}
@@ -440,16 +445,11 @@ func (s3a *S3ApiServer) ensureDirectoryAllEmpty(filerClient filer_pb.SeaweedFile
 	var startFrom string
 	var isExhausted bool
 	var foundEntry bool
-	cutOffTimeAtSec := time.Now().Unix() + cutoffTimeNewEmptyDir
 	for fileCounter == 0 && !isExhausted && err == nil {
 		err = filer_pb.SeaweedList(filerClient, currentDir, "", func(entry *filer_pb.Entry, isLast bool) error {
 			foundEntry = true
-			if entry.IsDirectory {
-				if entry.Attributes != nil && cutOffTimeAtSec >= entry.Attributes.GetCrtime() {
-					fileCounter++
-				} else {
-					subDirs = append(subDirs, entry.Name)
-				}
+			if entry.IsOlderDir() {
+				subDirs = append(subDirs, entry.Name)
 			} else {
 				fileCounter++
 			}
@@ -482,7 +482,7 @@ func (s3a *S3ApiServer) ensureDirectoryAllEmpty(filerClient filer_pb.SeaweedFile
 	}
 
 	glog.V(1).Infof("deleting empty folder %s", currentDir)
-	if err = doDeleteEntry(filerClient, parentDir, name, true, true); err != nil {
+	if err = doDeleteEntry(filerClient, parentDir, name, true, false); err != nil {
 		return
 	}
 
